@@ -1,0 +1,14 @@
+node_modules
+.next
+out
+build
+.env*
+!.env.example
+*.tsbuildinfo
+next-env.d.ts
+.DS_Store
+.claude/
+
+# Local driver for headless end-to-end runs. Takes a private key on the
+# command line and signs real mainnet transactions, so it stays out of git.
+drive-ui.mjs

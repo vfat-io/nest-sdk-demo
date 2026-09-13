@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  # Every PR, whatever its base, so a PR stacked on a feature branch still
+  # runs. Filtering to [main] here is how a repo ends up with open PRs that
+  # never ran anything.
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: 'npm'
+          check-latest: true
+
+      # npm ci, never npm install: it installs exactly the lockfile and fails
+      # if package.json has drifted from it, rather than rewriting it.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+  # Separate from `check` so a dependency advisory is legible on its own and
+  # does not read as a code failure.
+  #
+  # Criticals only. This page shipped next 16.0.1 with an unauthenticated RCE
+  # (GHSA-9qr9-h5gf-34mp) for two commits because nothing watched, and a
+  # truncated local `npm audit` was read as clean. Runtime dependencies only:
+  # a dev-only advisory does not reach anyone using the page.
+  audit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+
+      - name: Fail on critical advisories in runtime dependencies
+        run: npm audit --omit=dev --audit-level=critical
