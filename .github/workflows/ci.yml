@@ -26,7 +26,6 @@ jobs:
         with:
           node-version: '26.13.0'
           cache: 'npm'
-          check-latest: true
 
       # npm ci, never npm install: it installs exactly the lockfile and fails
       # if package.json has drifted from it, rather than rewriting it.
