@@ -24,9 +24,8 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22.x
+          node-version: '26.13.0'
           cache: 'npm'
-          check-latest: true
 
       # npm ci, never npm install: it installs exactly the lockfile and fails
       # if package.json has drifted from it, rather than rewriting it.
@@ -57,7 +56,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22.x
+          node-version: '26.13.0'
 
       - name: Fail on critical advisories in runtime dependencies
         run: npm audit --omit=dev --audit-level=critical
