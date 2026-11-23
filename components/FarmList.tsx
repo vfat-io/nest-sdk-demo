@@ -1,7 +1,7 @@
 'use client';
 
 import { FarmInfo } from '@vfat-io/sickle-sdk';
-import { farmPair } from '@/lib/nest';
+import { farmKey, farmPair } from '@/lib/nest';
 import { formatAprPercent, formatUsd, shortAddress } from '@/lib/format';
 
 interface Props {
@@ -14,10 +14,13 @@ export default function FarmList({ farms, selected, onSelect }: Props) {
   return (
     <div className="flex max-h-96 flex-col divide-y divide-zinc-200 overflow-y-auto rounded border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
       {farms.map(farm => {
-        const isSelected = selected?.address === farm.address;
+        const key = farmKey(farm);
+        const isSelected = selected !== undefined && farmKey(selected) === key;
+        const poolId = farm.pool.poolId;
         return (
           <button
-            key={farm.address}
+            key={key}
+            aria-pressed={isSelected}
             onClick={() => onSelect(farm)}
             className={`flex items-center justify-between gap-4 px-4 py-3 text-left text-sm transition-colors ${
               isSelected
@@ -28,10 +31,15 @@ export default function FarmList({ farms, selected, onSelect }: Props) {
             <div className="flex min-w-0 flex-col">
               <span className="font-medium">{farmPair(farm)}</span>
               <span className="truncate font-mono text-xs text-zinc-500">
-                {shortAddress(farm.address)}
+                {poolId ? `Pool ID ${shortAddress(poolId)}` : shortAddress(farm.address)}
                 {farm.nftManagerAddress &&
                   ` · manager ${shortAddress(farm.nftManagerAddress)}`}
               </span>
+              {poolId && farm.pool.hooksAddress && (
+                <span className="truncate font-mono text-xs text-zinc-500">
+                  Hook {shortAddress(farm.pool.hooksAddress)}
+                </span>
+              )}
             </div>
             <div className="flex shrink-0 flex-col items-end">
               <span className="font-medium">

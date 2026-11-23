@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Address, erc20Abi, parseUnits } from 'viem';
 import { useAccount, useReadContract, useWriteContract } from 'wagmi';
 import {
@@ -9,7 +9,8 @@ import {
   NftPool,
   PlanApproval,
 } from '@vfat-io/sickle-sdk';
-import { NEST_CHAIN_ID, farmTokens } from '@/lib/nest';
+import { farmKey, farmTokens } from '@/lib/nest';
+import { ELYSIUM_CHAIN_ID, NestChainId, transactionUrl } from '@/lib/chains';
 import { explainGasStatus, formatAmount, shortAddress } from '@/lib/format';
 import { gasWithHeadroom } from '@/lib/gas';
 import { shortWriteError } from '@/lib/format';
@@ -23,7 +24,9 @@ import { useBoundQuote } from '@/lib/quote';
 import { useTxOutcome } from '@/lib/receipt';
 
 interface Props {
+  chainId: NestChainId;
   farm: FarmInfo;
+  onAutoExitQuoted?: (address: Address) => void;
   /** Called after a deposit confirms on-chain. */
   onDeposited?: () => void;
 }
@@ -53,7 +56,9 @@ const PRICE_MARGIN = { min: 5, max: 5 };
  * quote's `detail`.
  */
 interface DepositRequest {
-  farmAddress: Address;
+  chainId: NestChainId;
+  farm: string;
+  walletAddress: Address | undefined;
   tokenAddress: Address | undefined;
   amount: bigint;
   autoExit: boolean;
@@ -68,8 +73,8 @@ interface DepositDetail {
 /** How many times to re-quote if spot moves out from under the trigger. */
 const CONTAINMENT_ATTEMPTS = 3;
 
-export default function DepositPanel({ farm, onDeposited }: Props) {
-  const { address, chainId } = useAccount();
+export default function DepositPanel({ chainId, farm, onDeposited, onAutoExitQuoted }: Props) {
+  const { address, chainId: walletChainId } = useAccount();
   const tokens = farmTokens(farm);
 
   const [tokenIndex, setTokenIndex] = useState(0);
@@ -78,11 +83,13 @@ export default function DepositPanel({ farm, onDeposited }: Props) {
 
   const token = tokens[tokenIndex];
   const decimals = token?.decimals ?? 18;
-  const wrongChain = chainId !== NEST_CHAIN_ID;
+  const wrongChain = walletChainId !== chainId;
 
   // Plain, not memoised: useBoundQuote keys on the serialised value.
   const request: DepositRequest = {
-    farmAddress: farm.address as Address,
+    chainId,
+    farm: farmKey(farm),
+    walletAddress: address,
     tokenAddress: token?.address as Address | undefined,
     amount: parseAmount(amountText, decimals),
     autoExit,
@@ -93,9 +100,15 @@ export default function DepositPanel({ farm, onDeposited }: Props) {
     DepositDetail
   >(request);
 
+  useEffect(() => {
+    if (quote?.detail.trigger && quote.request.walletAddress) {
+      onAutoExitQuoted?.(quote.request.walletAddress);
+    }
+  }, [onAutoExitQuoted, quote]);
+
   const { data: balance } = useReadContract({
     abi: erc20Abi,
-    chainId: NEST_CHAIN_ID,
+    chainId,
     address: token?.address as Address | undefined,
     functionName: 'balanceOf',
     args: address ? [address] : undefined,
@@ -132,7 +145,7 @@ export default function DepositPanel({ farm, onDeposited }: Props) {
     onDeposited?.();
   }, [discard, onDeposited, reset]);
 
-  const { isConfirming, succeeded, reverted } = useTxOutcome(txHash, onConfirmed);
+  const { isConfirming, succeeded, reverted } = useTxOutcome(txHash, chainId, onConfirmed);
 
   /**
    * Whether auto-exit can be offered at all.
@@ -171,7 +184,7 @@ export default function DepositPanel({ farm, onDeposited }: Props) {
    */
   const { data: onChainAllowance } = useReadContract({
     abi: erc20Abi,
-    chainId: NEST_CHAIN_ID,
+    chainId,
     address: quotedToken,
     functionName: 'allowance',
     args: address && quote?.callData.planPreparation?.spender
@@ -202,9 +215,10 @@ export default function DepositPanel({ farm, onDeposited }: Props) {
   });
 
   async function buildQuote() {
-    if (!address) return;
+    if (wrongChain) return;
     reset();
     await build(async req => {
+      if (!req.walletAddress) throw new Error('Connect a wallet to quote');
       if (!req.tokenAddress) throw new Error('Pick a token');
       if (req.amount === 0n) throw new Error('Enter an amount');
 
@@ -237,7 +251,7 @@ export default function DepositPanel({ farm, onDeposited }: Props) {
       // Pass one tells us the range the API actually prices, which is the only
       // honest basis for a trigger. It is also the quote itself when auto-exit
       // is off, so nothing is wasted.
-      const plain = await base().getCallData(address);
+      const plain = await base().getCallData(req.walletAddress);
       if (!req.autoExit) {
         return { callData: plain, detail: { minted: rangeOf(plain) } };
       }
@@ -252,15 +266,24 @@ export default function DepositPanel({ farm, onDeposited }: Props) {
       // enough to shift the range out from under it, widen to the new range
       // and try again rather than signing a trigger that sits inside it.
       for (let attempt = 0; attempt < CONTAINMENT_ATTEMPTS; attempt++) {
-        const callData = await base()
-          .addAutoExit({
-            triggerTicks: trigger,
-            exitTokenOutLow: tokenAddress,
-            exitTokenOutHigh: tokenAddress,
-            priceImpactBP: 500,
-            slippageBP: 100,
-          })
-          .getCallData(address);
+        let callData: ContractCallData;
+        try {
+          callData = await base()
+            .addAutoExit({
+              triggerTicks: trigger,
+              exitTokenOutLow: tokenAddress,
+              exitTokenOutHigh: tokenAddress,
+              priceImpactBP: 500,
+              slippageBP: 100,
+            })
+            .getCallData(req.walletAddress);
+        } catch (error) {
+          if (error instanceof Error && 'responseBody' in error &&
+            typeof error.responseBody === 'string' && error.responseBody.includes('"AVR_AUTOMATION_UNAVAILABLE"')) {
+            throw new Error('Auto-exit is currently unavailable for this pool. Uncheck it to get a manual deposit quote.');
+          }
+          throw error;
+        }
 
         const minted = rangeOf(callData);
         if (encloses(trigger, minted)) {
@@ -277,10 +300,11 @@ export default function DepositPanel({ farm, onDeposited }: Props) {
   }
 
   function sendApproval(approval: PlanApproval) {
+    if (wrongChain || !quote) return;
     inFlight.current = 'approval';
     writeContract({
       abi: erc20Abi,
-      chainId: NEST_CHAIN_ID,
+      chainId,
       address: approval.tokenAddress,
       functionName: 'approve',
       args: [approval.spender, BigInt(approval.amount ?? '0')],
@@ -288,13 +312,11 @@ export default function DepositPanel({ farm, onDeposited }: Props) {
   }
 
   function sendDeposit() {
-    if (!quote) return;
+    if (wrongChain || !quote) return;
     inFlight.current = 'deposit';
     const { callData } = quote;
     writeContract({
-      // Pinned: without it the connector uses whichever chain the wallet is
-      // on, and HyperEVM calldata would go to those addresses elsewhere.
-      chainId: NEST_CHAIN_ID,
+      chainId,
       abi: callData.abi,
       address: callData.address,
       functionName: callData.functionName,
@@ -362,7 +384,9 @@ export default function DepositPanel({ farm, onDeposited }: Props) {
           Auto-exit to {token?.symbol} if the price leaves the range
           <span className="block text-xs text-zinc-500">
             {exitAvailable
-              ? 'The exact trigger is resolved when you quote, from the range the quote says it will mint, and shown below before you sign. Needs consent on this chain — see below.'
+              ? chainId === ELYSIUM_CHAIN_ID
+                ? 'The quote checks availability and shows the trigger. The keeper needs your consent to execute it.'
+                : 'The quote shows the trigger before you sign. The keeper needs your consent to execute it.'
               : `Unavailable for this pool: unusable tick spacing (${tickSpacing}).`}
           </span>
         </span>
@@ -475,7 +499,7 @@ export default function DepositPanel({ farm, onDeposited }: Props) {
         <p className="break-all font-mono text-xs text-zinc-500">
           {succeeded ? 'Confirmed: ' : reverted ? 'Reverted on-chain: ' : 'Sent: '}
           <a
-            href={`https://www.hyperscan.com/tx/${txHash}`}
+            href={transactionUrl(chainId, txHash)}
             target="_blank"
             rel="noreferrer"
             className="underline underline-offset-2"

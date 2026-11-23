@@ -4,7 +4,7 @@ import { useCallback, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useAccount, useWriteContract } from 'wagmi';
 import { Automation, Chains, MainAPI } from '@vfat-io/sickle-sdk';
-import { NEST_CHAIN_ID } from '@/lib/nest';
+import type { NestChainId } from '@/lib/chains';
 import { shortAddress, shortWriteError } from '@/lib/format';
 import { useTxOutcome } from '@/lib/receipt';
 import { indexDeadline, pollWhileIndexing } from '@/lib/indexing';
@@ -13,6 +13,7 @@ import { indexDeadline, pollWhileIndexing } from '@/lib/indexing';
 export const AUTOMATION_QUERY_KEY = 'nest-automation';
 
 interface Props {
+  chainId: NestChainId;
   /**
    * Deadline until which a deposit's Sickle deployment is still expected.
    *
@@ -29,9 +30,9 @@ interface Props {
  * `ActionNotConsented`, silently as far as the user is concerned. HyperEVM is
  * one of them.
  */
-export default function AutomationPanel({ expectDeployedUntil = 0 }: Props) {
-  const { address, chainId } = useAccount();
-  const wrongChain = chainId !== NEST_CHAIN_ID;
+export default function AutomationPanel({ chainId, expectDeployedUntil = 0 }: Props) {
+  const { address, chainId: walletChainId } = useAccount();
+  const wrongChain = walletChainId !== chainId;
 
   // Set when a consent confirms, so the poll below knows what it is waiting
   // for. A ref because it is written from an event, never from render.
@@ -39,7 +40,7 @@ export default function AutomationPanel({ expectDeployedUntil = 0 }: Props) {
   const [, forcePoll] = useState(0);
 
   const { data, error, refetch } = useQuery({
-    queryKey: [AUTOMATION_QUERY_KEY, address],
+    queryKey: [AUTOMATION_QUERY_KEY, chainId, address],
     enabled: Boolean(address),
     refetchInterval: query => {
       const entry = query.state.data?.entry;
@@ -53,11 +54,11 @@ export default function AutomationPanel({ expectDeployedUntil = 0 }: Props) {
     queryFn: async () => {
       const [sickles, requiresConsent, strategy] = await Promise.all([
         MainAPI.fetchUserSickles(address!),
-        Chains.automationRequiresConsent(NEST_CHAIN_ID),
-        Chains.fetchAutomationStrategyAddress(NEST_CHAIN_ID),
+        Chains.automationRequiresConsent(chainId),
+        Chains.fetchAutomationStrategyAddress(chainId),
       ]);
       return {
-        entry: sickles[String(NEST_CHAIN_ID)],
+        entry: sickles[String(chainId)],
         requiresConsent,
         strategy,
       };
@@ -83,7 +84,7 @@ export default function AutomationPanel({ expectDeployedUntil = 0 }: Props) {
     void refetch();
   }, [reset, refetch]);
 
-  const { isConfirming, reverted } = useTxOutcome(txHash, onConfirmed);
+  const { isConfirming, reverted } = useTxOutcome(txHash, chainId, onConfirmed);
 
   if (!address || !data) return null;
 
@@ -96,18 +97,18 @@ export default function AutomationPanel({ expectDeployedUntil = 0 }: Props) {
   const busy = isPending || isConfirming;
 
   function grantExitConsent() {
-    if (!strategy || !sickleAddress) return;
+    if (wrongChain || !strategy || !sickleAddress) return;
     // setActionConsent overwrites the mask, so the current one is OR-ed in
     // rather than replaced — otherwise this would revoke everything else.
     const call = Automation.buildSetActionConsent({
-      chainId: NEST_CHAIN_ID,
+      chainId,
       automationStrategyAddress: strategy,
       sickleAddress,
       permissions: ['nftExit'],
       currentConsentMask: consentMask,
     });
     writeContract({
-      chainId: NEST_CHAIN_ID,
+      chainId,
       abi: call.abi,
       address: call.address,
       functionName: call.functionName,

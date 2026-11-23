@@ -1,8 +1,7 @@
 import { Address, FarmInfo, MainAPI, TokenBalance } from '@vfat-io/sickle-sdk';
+import { ELYSIUM_CHAIN_ID, NestChainId } from './chains';
 
-/** Nest runs on HyperEVM, and only on HyperEVM. */
-export const NEST_CHAIN_ID = 999;
-export const NEST_PROTOCOL_ID = 'nest';
+const NEST_PROTOCOL_ID = 'nest';
 
 /**
  * Every Nest farm, killed ones included, deepest liquidity first.
@@ -15,11 +14,26 @@ export const NEST_PROTOCOL_ID = 'nest';
  *
  * `/v4/farms` is several MB unfiltered, so always pass the chain.
  */
-export async function fetchNestFarms(): Promise<FarmInfo[]> {
-  const farms = await MainAPI.fetchFarms(NEST_CHAIN_ID);
+export async function fetchNestFarms(chainId: NestChainId): Promise<FarmInfo[]> {
+  const farms = await MainAPI.fetchFarms(chainId);
   return farms
-    .filter(farm => farm.protocol.id === NEST_PROTOCOL_ID)
+    .filter(farm =>
+      farm.protocol.id === NEST_PROTOCOL_ID &&
+      (chainId !== ELYSIUM_CHAIN_ID || (
+        farm.type === 'UNISWAP_V4' && Boolean(farm.pool.poolId && farm.nftManagerAddress)
+      ))
+    )
     .sort((a, b) => (b.snapshot?.stakedLiquidity ?? 0) - (a.snapshot?.stakedLiquidity ?? 0));
+}
+
+function poolKey(address: string, poolId?: string): string {
+  return `${address.toLowerCase()}:${poolId?.toLowerCase() ?? ''}`;
+}
+
+/** A v4 PoolManager address is shared by every pool in its deployment. */
+export function farmKey(farm: FarmInfo): string {
+  const poolId = farm.type === 'UNISWAP_V4' ? farm.pool.poolId : undefined;
+  return poolKey(farm.address, poolId);
 }
 
 /** The farms a new position can be opened in. */
@@ -45,6 +59,11 @@ export interface NestPosition {
   nftId: bigint;
 }
 
+export function positionKey({ position, farm, nftId }: NestPosition): string {
+  const managerAddress = position.nft?.managerAddress ?? farm.nftManagerAddress;
+  return `${farmKey(farm)}:${managerAddress?.toLowerCase() ?? ''}:${nftId}`;
+}
+
 /**
  * The caller's open Nest positions.
  *
@@ -54,15 +73,22 @@ export interface NestPosition {
  */
 export async function fetchNestPositions(
   address: Address,
+  chainId: NestChainId,
   farms: FarmInfo[]
 ): Promise<NestPosition[]> {
   const balances = await MainAPI.fetchUserPositions(address);
-  const byAddress = new Map(farms.map(f => [f.address.toLowerCase(), f]));
+  const byPool = new Map(farms.map(farm => [farmKey(farm), farm]));
 
   return balances.flatMap(position => {
-    if (position.chainId !== NEST_CHAIN_ID || !position.nft) return [];
-    const farm = byAddress.get((position.farmAddress ?? '').toLowerCase());
+    if (position.chainId !== chainId || !position.nft || !position.farmAddress) return [];
+    const poolId = position.poolId && position.poolId !== '0' ? position.poolId : position.poolIdHash;
+    const farm = byPool.get(poolKey(position.farmAddress, poolId)) ??
+      (chainId === ELYSIUM_CHAIN_ID ? undefined : byPool.get(poolKey(position.farmAddress)));
     if (!farm) return [];
+    if (
+      position.nft.managerAddress &&
+      position.nft.managerAddress.toLowerCase() !== farm.nftManagerAddress?.toLowerCase()
+    ) return [];
     return [{ position, farm, nftId: position.nft.nftId }];
   });
 }

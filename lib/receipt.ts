@@ -2,6 +2,7 @@
 
 import { useEffect, useRef } from 'react';
 import { useWaitForTransactionReceipt } from 'wagmi';
+import type { NestChainId } from './chains';
 
 /**
  * The outcome of one transaction, acted on exactly once.
@@ -19,10 +20,11 @@ import { useWaitForTransactionReceipt } from 'wagmi';
  */
 export function useTxOutcome(
   hash: `0x${string}` | undefined,
+  chainId: NestChainId,
   onSuccess: () => void
 ) {
   const { data: receipt, isLoading: isConfirming } =
-    useWaitForTransactionReceipt({ hash });
+    useWaitForTransactionReceipt({ hash, chainId });
   const handled = useRef<string | undefined>(undefined);
   const status = receipt?.status;
 

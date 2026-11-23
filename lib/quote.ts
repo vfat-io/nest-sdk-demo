@@ -59,7 +59,7 @@ function stableKey(value: unknown): string {
  * On a page that only ever talks to mainnet, submitting a materially different
  * financial action than the one on screen is the worst thing it could do.
  */
-export function useBoundQuote<TRequest, TDetail = undefined>(
+export function useBoundQuote<TRequest extends { chainId: number }, TDetail = undefined>(
   request: TRequest
 ) {
   // Deliberately not memoised. Only the serialised value is load-bearing —
@@ -96,6 +96,9 @@ export function useBoundQuote<TRequest, TDetail = undefined>(
     try {
       const { callData, detail } = await fn(requested);
       if (mine !== generation.current) return;
+      if (callData.chainId !== requested.chainId) {
+        throw new Error(`Quote returned chain ${callData.chainId}. Expected ${requested.chainId}.`);
+      }
       setHeld({
         key: requestedKey,
         quote: { request: requested, callData, detail },

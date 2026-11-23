@@ -3,18 +3,9 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { WagmiProvider, createConfig, http } from 'wagmi';
 import { injected } from 'wagmi/connectors';
-import { getChain } from '@vfat-io/sickle-sdk';
-import { NEST_CHAIN_ID } from '@/lib/nest';
+import { ELYSIUM_CHAIN_ID, HYPEREVM_CHAIN_ID, nestChains } from '@/lib/chains';
 
 const queryClient = new QueryClient();
-
-/**
- * Only HyperEVM.
- *
- * The SDK's `supportedChains` carries every chain viem knows about; Nest is on
- * one, so naming it directly keeps the wagmi config and the bundle small.
- */
-const nestChain = getChain(NEST_CHAIN_ID);
 
 /**
  * `injected()` alone.
@@ -24,9 +15,9 @@ const nestChain = getChain(NEST_CHAIN_ID);
  * Coinbase CDP SDK, which does not resolve under Turbopack.
  */
 const config = createConfig({
-  chains: [nestChain],
+  chains: [nestChains[HYPEREVM_CHAIN_ID], nestChains[ELYSIUM_CHAIN_ID]],
   connectors: [injected()],
-  transports: { [nestChain.id]: http() },
+  transports: { [HYPEREVM_CHAIN_ID]: http(), [ELYSIUM_CHAIN_ID]: http() },
   ssr: false,
 });
 
