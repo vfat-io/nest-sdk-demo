@@ -1,16 +1,17 @@
 'use client';
 
 import { useAccount, useConnect, useDisconnect, useSwitchChain } from 'wagmi';
-import { NEST_CHAIN_ID } from '@/lib/nest';
-import { shortAddress } from '@/lib/format';
+import { NestChainId, nestChains } from '@/lib/chains';
+import { shortAddress, shortWriteError } from '@/lib/format';
 
-export default function ConnectWallet() {
+export default function ConnectWallet({ targetChainId }: { targetChainId: NestChainId }) {
   const { address, isConnected, chainId } = useAccount();
   const { connectors, connect, isPending } = useConnect();
   const { disconnect } = useDisconnect();
-  const { switchChain } = useSwitchChain();
+  const { switchChain, error, isPending: isSwitching } = useSwitchChain();
 
-  const wrongChain = isConnected && chainId !== NEST_CHAIN_ID;
+  const wrongChain = isConnected && chainId !== targetChainId;
+  const chainName = nestChains[targetChainId].name;
 
   if (!isConnected) {
     return (
@@ -18,7 +19,7 @@ export default function ConnectWallet() {
         {connectors.map(connector => (
           <button
             key={connector.uid}
-            onClick={() => connect({ connector })}
+            onClick={() => connect({ connector, chainId: targetChainId })}
             disabled={isPending}
             className="rounded border border-zinc-300 px-3 py-1.5 text-sm font-medium hover:bg-zinc-100 disabled:opacity-50 dark:border-zinc-700 dark:hover:bg-zinc-900"
           >
@@ -34,13 +35,14 @@ export default function ConnectWallet() {
       <span className="font-mono">{address && shortAddress(address)}</span>
       {wrongChain ? (
         <button
-          onClick={() => switchChain({ chainId: NEST_CHAIN_ID })}
-          className="rounded bg-amber-500 px-3 py-1.5 text-sm font-medium text-white hover:bg-amber-600"
+          onClick={() => switchChain({ chainId: targetChainId })}
+          disabled={isSwitching}
+          className="rounded bg-amber-500 px-3 py-1.5 text-sm font-medium text-white hover:bg-amber-600 disabled:opacity-50"
         >
-          Switch to HyperEVM
+          Switch to {chainName}
         </button>
       ) : (
-        <span className="text-zinc-500">HyperEVM</span>
+        <span className="text-zinc-500">{chainName}</span>
       )}
       <button
         onClick={() => disconnect()}
@@ -48,6 +50,11 @@ export default function ConnectWallet() {
       >
         Disconnect
       </button>
+      {wrongChain && error && (
+        <p role="alert" className="basis-full text-red-600 dark:text-red-400">
+          {shortWriteError(error)}
+        </p>
+      )}
     </div>
   );
 }

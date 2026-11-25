@@ -5,11 +5,12 @@ import { Address, erc20Abi, parseUnits } from 'viem';
 import { useAccount, useReadContract, useWriteContract } from 'wagmi';
 import { ContractCallData, NftPool } from '@vfat-io/sickle-sdk';
 import {
-  NEST_CHAIN_ID,
   NestPosition,
+  farmKey,
   farmTokens,
   positionValueUsd,
 } from '@/lib/nest';
+import { NestChainId, transactionUrl } from '@/lib/chains';
 import {
   explainGasStatus,
   formatAmount,
@@ -22,6 +23,7 @@ import { useBoundQuote } from '@/lib/quote';
 import { useTxOutcome } from '@/lib/receipt';
 
 interface Props {
+  chainId: NestChainId;
   entry: NestPosition;
   /** Called after a transaction confirms on-chain, so the list can refresh. */
   onChanged: () => void;
@@ -51,6 +53,9 @@ const ACTIONS: { id: Action; label: string; submit: string; blurb: string }[] = 
  * than leaving calldata that no longer matches the screen.
  */
 interface ManageRequest {
+  chainId: NestChainId;
+  farm: string;
+  walletAddress: Address | undefined;
   action: Action;
   nftId: bigint;
   tokenAddress: Address | undefined;
@@ -59,8 +64,8 @@ interface ManageRequest {
   margin: number;
 }
 
-export default function ManagePanel({ entry, onChanged }: Props) {
-  const { address, chainId } = useAccount();
+export default function ManagePanel({ chainId, entry, onChanged }: Props) {
+  const { address, chainId: walletChainId } = useAccount();
   const tokens = farmTokens(entry.farm);
 
   const [action, setAction] = useState<Action>('increase');
@@ -75,6 +80,9 @@ export default function ManagePanel({ entry, onChanged }: Props) {
   // Plain, not memoised: useBoundQuote keys on the serialised value, so the
   // object's identity is never load-bearing.
   const request: ManageRequest = {
+    chainId,
+    farm: farmKey(entry.farm),
+    walletAddress: address,
     action,
     nftId: entry.nftId,
     tokenAddress: token?.address as Address | undefined,
@@ -119,9 +127,9 @@ export default function ManagePanel({ entry, onChanged }: Props) {
     onChanged();
   }, [discard, onChanged, reset]);
 
-  const { isConfirming, succeeded, reverted } = useTxOutcome(txHash, onConfirmed);
+  const { isConfirming, succeeded, reverted } = useTxOutcome(txHash, chainId, onConfirmed);
 
-  const wrongChain = chainId !== NEST_CHAIN_ID;
+  const wrongChain = walletChainId !== chainId;
 
   // Read the approval requirement from the quote's own snapshot, never from
   // the live controls — otherwise an edited amount checks the wrong figure.
@@ -132,7 +140,7 @@ export default function ManagePanel({ entry, onChanged }: Props) {
 
   const { data: onChainAllowance } = useReadContract({
     abi: erc20Abi,
-    chainId: NEST_CHAIN_ID,
+    chainId,
     address: quotedToken,
     functionName: 'allowance',
     args: address && spender ? [address, spender] : undefined,
@@ -156,9 +164,11 @@ export default function ManagePanel({ entry, onChanged }: Props) {
   }
 
   async function buildQuote() {
-    if (!address) return;
+    if (wrongChain) return;
     reset();
     await build(async req => {
+      const address = req.walletAddress;
+      if (!address) throw new Error('Connect a wallet to quote');
       const pool = NftPool.fromFarmInfo(entry.farm);
       const nftId = req.nftId;
       let built: ContractCallData;
@@ -230,11 +240,11 @@ export default function ManagePanel({ entry, onChanged }: Props) {
   }
 
   function approve() {
-    if (!spender || !quotedToken || quotedAmount === 0n) return;
+    if (wrongChain || !spender || !quotedToken || quotedAmount === 0n) return;
     inFlight.current = 'approval';
     writeContract({
       abi: erc20Abi,
-      chainId: NEST_CHAIN_ID,
+      chainId,
       address: quotedToken,
       functionName: 'approve',
       args: [spender, quotedAmount],
@@ -242,13 +252,11 @@ export default function ManagePanel({ entry, onChanged }: Props) {
   }
 
   function submit() {
-    if (!quote) return;
+    if (wrongChain || !quote) return;
     inFlight.current = 'action';
     const { callData } = quote;
     writeContract({
-      // Pinned, so the connector cannot send HyperEVM calldata to whatever
-      // occupies these addresses on whichever chain the wallet is on.
-      chainId: NEST_CHAIN_ID,
+      chainId,
       abi: callData.abi,
       address: callData.address,
       functionName: callData.functionName,
@@ -439,7 +447,7 @@ export default function ManagePanel({ entry, onChanged }: Props) {
         <p className="break-all font-mono text-xs text-zinc-500">
           {succeeded ? 'Confirmed: ' : reverted ? 'Reverted on-chain: ' : 'Sent: '}
           <a
-            href={`https://www.hyperscan.com/tx/${txHash}`}
+            href={transactionUrl(chainId, txHash)}
             target="_blank"
             rel="noreferrer"
             className="underline underline-offset-2"

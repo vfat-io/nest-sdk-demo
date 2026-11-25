@@ -3,28 +3,58 @@
 A working example of opening and managing a [Nest](https://app.usenest.xyz)
 position through [`@vfat-io/sickle-sdk`](https://www.npmjs.com/package/@vfat-io/sickle-sdk).
 
-Everything on the page comes from the live vfat API — the farm list, the quote,
-the approvals and the automation state. It connects a real wallet to HyperEVM
-and sends real transactions.
+The farm list, quotes, approvals and automation state come from the live vfat
+API. The demo connects a wallet to HyperEVM or Elysium mainnet.
 
 ## Running it
 
 ```bash
-npm install
+npm ci
 npm run dev
 ```
 
-Then open http://localhost:3000 and connect an injected wallet (MetaMask,
-Rabby, …) on HyperEVM.
+Open http://localhost:3000 for HyperEVM (chain 999) or
+http://localhost:3000/elysium for Nest Uniswap v4 on Elysium (chain 99901).
+Connect an injected wallet such as MetaMask or Rabby. Elysium uses HYPE for gas.
 
 The SDK is an ordinary npm dependency, so installing needs nothing but the
 public npm registry.
+
+## Elysium and Uniswap v4
+
+`MainAPI.fetchFarms(99901)` returns Nest v4 and Classic farms. The Elysium
+demo selects the Nest `UNISWAP_V4` entries. Several pools share the same
+PoolManager and token pair. Use the PoolManager address and `farm.pool.poolId`
+to select a pool and match its positions. Pass the farm record to
+`NftPool.fromFarmInfo(farm)` to carry the pool ID and NFT manager into the quote.
+vfat builds the calldata for the selected pool and its hook.
+
+The wallet config defines Elysium with viem's `defineChain`. The demo pins
+the quote, approvals, transaction and receipt lookup to the selected chain.
+`NftPool` manages the positions held by the user's Sickle. Wallet-held
+positions are displayed with their custody identified.
+
+For a new Elysium position, choose auto-rebalance, auto-harvest or
+auto-compound, auto-exit, and auto-deposit of eligible leftover tokens.
+Harvest and compound are two modes for the same fee setting. The live quote
+API reports availability per pool, and a rejected automation quote leaves
+the manual deposit flow available.
+
+After the deposit confirms, **Keeper setup** shows the selected actions and
+the wallet transactions needed to approve the keeper and grant missing
+permissions. For a held Elysium position, the demo reads its saved settings
+from the NFT settings registry. Runs follow the position's triggers and gas
+economics. See [vfat's automation and funding guide](https://vfat.io/docs/automation).
+
+The position's Harvest and Compound actions handle fees. Elysium NEST
+incentives use the separate wallet or Sickle claim paths described in the
+[vfat Quote API](https://quote.vfat.io/openapi.json).
 
 ## What it shows
 
 Each of these is one SDK call, and each was broken or missing until recently.
 
-**Farms.** `MainAPI.fetchFarms(999)` filtered to Nest. Note the manager address
+**Farms.** `MainAPI.fetchFarms(chainId)` filtered to Nest. Note the manager address
 under each pair: it is never the same as the farm address, and the NFT quote
 endpoints answer `400 Farm not supported` without it. `NftPool.fromFarmInfo`
 carries it across so you never have to think about it.
@@ -65,10 +95,9 @@ protocol distributes separately, which these actions do not touch.
   then typing 10 used to submit 50%. An in-flight quote that resolves after you
   switch tabs is inert for the same reason: the response carries the key it was
   requested with. `lib/quote.ts`.
-- *Every write is pinned to chain 999.* `writeContract` without `chainId` uses
-  whatever chain the wallet is on, which would send HyperEVM calldata to
-  whatever occupies those addresses elsewhere. The panels are also hidden off
-  HyperEVM, so there is nothing to press.
+- *Every write is pinned to the demo's selected chain.* Switch the wallet to
+  that chain to open the quote and transaction panels. A quote whose returned
+  chain differs from the selected chain is discarded.
 - *A killed farm hides the deposit, not the position.* Killed farms are still
   loaded and matched, so a holder can see and exit an old NFT; only the picker
   filters them. Filtering earlier made the position disappear along with every
@@ -78,22 +107,13 @@ protocol distributes separately, which these actions do not touch.
   says the chain accepted it. `lib/receipt.ts` acts on each outcome once, from
   an effect rather than from render.
 
-**Auto-exit ticks come from the quote, not from a cached tick.** Quoting a
-deposit reveals the exact range it will mint — the API puts it in the calldata
-at `addLiquidityParams.tickLower/tickUpper` — so the trigger is derived from
-*that*, with one tick spacing of clearance, and then checked against the range
-the final calldata mints before the button appears. In range means no exit; a
-tick outside means exit, and the panel shows both numbers before you sign.
-
-Two weaker versions came before it. One absolute tick pair cannot work across
-pools at all: Nest's farms span roughly -388673 to 264454, so a fixed low tick
-sits above spot for some of them and a fresh position is immediately
-exit-eligible. Deriving from `farm.pool.tick` is better but still wrong — that
-tick is whatever `/v4/farms` returned when the page loaded, so on a page left
-open the trigger ends up centred on a stale spot while the position is minted
-around the current one, and a band-width buffer only buys about 1% of drift
-before the trigger falls *inside* the position it is supposed to contain.
-`lib/ticks.ts`.
+**Rebalance and exit use the quoted mint ticks.** The demo reads the first
+quote's range, builds the settings with `buildNftSettings`, and passes both
+fixed ticks and the settings to `QuoteAPI.DepositTokenToNft`. It verifies
+the final calldata's ticks and settings before offering the deposit. New
+rebalance ranges keep the same width. When both actions are on, the demo
+places the fixed exit triggers outside the initial range and uses them as
+the rebalance cutoffs. `lib/depositQuote.ts` and `lib/automation.ts`.
 
 **A failed send is never silent.** `writeContract` can fail before anything
 reaches the chain — a rejection in the wallet, gas estimation reverting on an
@@ -115,37 +135,36 @@ tree. Passing the estimate verbatim reverted a deposit here at 950,395 gas with
 `ReentrancySentryOOG`; the same deposit then needed 1,301,233. `lib/gas.ts` adds
 20% for every write. Unused limit is not charged.
 
-**Automation consent.** HyperEVM sets `sickle.automationRequiresConsent`, which
-means the keeper reverts `ActionNotConsented` until the Sickle owner has
-consented — silently, as far as the user can tell. `AutomationPanel` reads the
-current mask and builds the `setActionConsent` call with
-`Automation.buildSetActionConsent`. That helper ORs into the existing mask,
-because `setActionConsent` overwrites it and a naive call would revoke consent
-the user had already given.
+**Automation consent.** HyperEVM and Elysium require per-action consent.
+`AutomationPanel` reads the current Sickle approval and on-chain consent mask.
+It uses `Automation.buildSetActionConsent` to add the selected action bits
+and preserve the rest. Regular Sickle NFT rebalances use `nftRebalanceGeneric`.
 
 ## Shape of the code
 
 ```
 lib/nest.ts             fetching Nest's farms and the caller's positions
+lib/chains.ts           wallet definitions for HyperEVM and Elysium
 lib/format.ts           display helpers
 lib/gas.ts              headroom over the quote's gas estimate
 lib/quote.ts            calldata bound to the inputs that produced it
 lib/receipt.ts          one-shot, status-aware receipt handling
-lib/ticks.ts            auto-exit range derived from the quote's own calldata
+lib/ticks.ts            quoted mint ranges and exit bands
+lib/depositQuote.ts     deposit quotes with verified NFT settings
+lib/automation.ts       settings and permission names for each action
 lib/indexing.ts         polling a write through the indexer's lag
-components/Providers    wagmi, scoped to HyperEVM only
+components/Providers    wagmi, scoped to the demo networks
 components/FarmList     the farm picker
 components/DepositPanel quote -> approve -> deposit
 components/PositionsPanel   the caller's open positions
 components/ManagePanel  increase, decrease, rebalance, harvest, compound, exit
-components/AutomationPanel  consent state and the consent call
+components/AutomationPanel  keeper approval and per-action consent
 ```
 
 Four deliberate choices worth calling out:
 
-- **The wagmi config names HyperEVM directly** rather than passing the SDK's
-  `supportedChains`, which carries every chain viem knows about. Nest is on one
-  chain; there is no reason to ship 660.
+- **The wagmi config includes the two demo networks.** HyperEVM uses the SDK
+  chain definition, and Elysium uses its public RPC and chain metadata.
 - **Quotes are built on an explicit "Get quote" click**, not on every keystroke.
   Quoting per keystroke invites a race where a slow early response overwrites a
   newer one and the Confirm button ends up holding calldata for input the user
@@ -201,6 +220,6 @@ so read the `CHANGELOG.md` that ships in the package first.
 
 ## Safety
 
-This spends real funds on HyperEVM mainnet. There is no testnet mode. Deposit,
+This spends real funds on HyperEVM and Elysium mainnet. Deposit,
 the six manage actions and the consent button all send real transactions;
 everything else is read-only.

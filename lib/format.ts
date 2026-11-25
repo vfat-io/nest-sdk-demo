@@ -41,6 +41,8 @@ export function explainGasStatus(status: string | undefined): string {
       return 'No simulation result.';
     case 'contract_call_failed':
       return 'Simulation failed — usually a missing approval or balance.';
+    case 'rpc_error':
+      return 'The chain RPC could not complete the simulation. Get a fresh quote.';
     case 'action_not_consented':
       return 'The Sickle owner has not consented to this automated action yet.';
     case 'sickle_not_deployed':

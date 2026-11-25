@@ -1,6 +1,7 @@
 'use client';
 
 import dynamic from 'next/dynamic';
+import type { NestChainId } from '@/lib/chains';
 
 /**
  * The interactive tree is client-only.
@@ -15,6 +16,6 @@ const NestDemo = dynamic(() => import('./NestDemo'), {
   loading: () => <p className="text-sm text-zinc-500">Loading…</p>,
 });
 
-export default function NestDemoClient() {
-  return <NestDemo />;
+export default function NestDemoClient({ chainId }: { chainId: NestChainId }) {
+  return <NestDemo chainId={chainId} />;
 }

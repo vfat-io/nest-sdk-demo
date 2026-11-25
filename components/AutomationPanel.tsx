@@ -1,195 +1,214 @@
 'use client';
 
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { useAccount, useWriteContract } from 'wagmi';
-import { Automation, Chains, MainAPI } from '@vfat-io/sickle-sdk';
-import { NEST_CHAIN_ID } from '@/lib/nest';
+import { useAccount, usePublicClient, useWriteContract } from 'wagmi';
+import { Automation, AutomationPermissionName, Chains, MainAPI } from '@vfat-io/sickle-sdk';
+import { isAddressEqual, zeroAddress } from 'viem';
+import { ELYSIUM_CHAIN_ID, NestChainId, nestChains } from '@/lib/chains';
+import { elysiumSettingsAbi, permissionLabel, permissionsForSettings, sickleApprovalAbi } from '@/lib/automation';
 import { shortAddress, shortWriteError } from '@/lib/format';
+import { pollWhileIndexing } from '@/lib/indexing';
+import type { NestPosition } from '@/lib/nest';
 import { useTxOutcome } from '@/lib/receipt';
-import { indexDeadline, pollWhileIndexing } from '@/lib/indexing';
 
-/** Shared so a deposit can invalidate this panel when it deploys the Sickle. */
 export const AUTOMATION_QUERY_KEY = 'nest-automation';
 
 interface Props {
-  /**
-   * Deadline until which a deposit's Sickle deployment is still expected.
-   *
-   * Set by the deposit, because this panel cannot see that one happened, and
-   * the Sickle it deployed will not be in the API's answer for a few seconds.
-   */
-  expectDeployedUntil?: number;
+  chainId: NestChainId;
+  permissions: AutomationPermissionName[];
+  position?: NestPosition;
+  expectDeployedUntil: number;
 }
 
-/**
- * Auto-exit does not fire until the Sickle owner consents.
- *
- * On chains whose `sickle.automationRequiresConsent` is true the keeper reverts
- * `ActionNotConsented`, silently as far as the user is concerned. HyperEVM is
- * one of them.
- */
-export default function AutomationPanel({ expectDeployedUntil = 0 }: Props) {
-  const { address, chainId } = useAccount();
-  const wrongChain = chainId !== NEST_CHAIN_ID;
+export default function AutomationPanel({ chainId, permissions, position, expectDeployedUntil }: Props) {
+  const { address, chainId: walletChainId } = useAccount();
+  const client = usePublicClient({ chainId });
+  const { writeContract, data: txHash, isPending, error: writeError, reset } = useWriteContract();
+  const [isPreparing, setIsPreparing] = useState(false);
+  const [prepareError, setPrepareError] = useState<string>();
 
-  // Set when a consent confirms, so the poll below knows what it is waiting
-  // for. A ref because it is written from an event, never from render.
-  const consentDeadline = useRef(0);
-  const [, forcePoll] = useState(0);
-
-  const { data, error, refetch } = useQuery({
-    queryKey: [AUTOMATION_QUERY_KEY, address],
-    enabled: Boolean(address),
-    refetchInterval: query => {
-      const entry = query.state.data?.entry;
-      const deployed = Boolean(entry?.sickleAddress);
-      const consented = entry?.automation?.consented?.nftExit === true;
-
-      const waitingForSickle = pollWhileIndexing(expectDeployedUntil, deployed);
-      if (waitingForSickle !== false) return waitingForSickle;
-      return pollWhileIndexing(consentDeadline.current, consented);
-    },
+  const selectedSickle = chainId === ELYSIUM_CHAIN_ID ? position?.position.sickleAddress : undefined;
+  const nftManager = position?.position.nft?.managerAddress ?? position?.farm.nftManagerAddress;
+  const isRelevant = permissions.length > 0 || Boolean(selectedSickle);
+  const wallet = useQuery({
+    queryKey: [AUTOMATION_QUERY_KEY, chainId, address],
+    enabled: Boolean(address && isRelevant),
     queryFn: async () => {
-      const [sickles, requiresConsent, strategy] = await Promise.all([
-        MainAPI.fetchUserSickles(address!),
-        Chains.automationRequiresConsent(NEST_CHAIN_ID),
-        Chains.fetchAutomationStrategyAddress(NEST_CHAIN_ID),
+      const [sickles, chain] = await Promise.all([MainAPI.fetchUserSickles(address!), Chains.fetchNetwork(chainId)]);
+      return { entry: sickles[String(chainId)], contracts: chain.sickle };
+    },
+    refetchInterval: query => pollWhileIndexing(expectDeployedUntil, Boolean(query.state.data?.entry?.sickleAddress)),
+  });
+  const entry = wallet.data?.entry;
+  const contracts = wallet.data?.contracts;
+  const sickleAddress = entry?.sickleAddress;
+  const strategy = contracts?.v5?.automationStrategy;
+  const registry = contracts?.v5?.nftSettingsRegistry;
+  const requiresConsent = contracts?.automationRequiresConsent === true;
+
+  // The v4 balance response can omit settings. For held Elysium NFTs, read the
+  // published registry with the exact Sickle, manager and token ID.
+  const saved = useQuery({
+    queryKey: ['nest-nft-settings', chainId, registry, selectedSickle, nftManager, position?.nftId.toString()],
+    enabled: Boolean(client && registry && selectedSickle && nftManager && position),
+    queryFn: () => client!.readContract({
+      address: registry!,
+      abi: elysiumSettingsAbi,
+      functionName: 'getNftSettings',
+      args: [{ sickle: selectedSickle!, nftManager: nftManager!, tokenId: position!.nftId }],
+    }),
+  });
+  const configured = saved.data && saved.data.poolId.toLowerCase() === position?.farm.pool.poolId?.toLowerCase() &&
+    isAddressEqual(saved.data.pool, position.farm.pool.address) ? permissionsForSettings(saved.data) : [];
+  const requested = [...new Set([...permissions, ...configured])];
+  const keeper = useQuery({
+    queryKey: ['nest-keeper', chainId, sickleAddress, strategy],
+    enabled: Boolean(client && sickleAddress && strategy && requested.length > 0),
+    queryFn: async () => {
+      const [approved, mask] = await Promise.all([
+        client!.readContract({ abi: sickleApprovalAbi, address: sickleAddress!, functionName: 'approved' }),
+        requiresConsent
+          ? client!.readContract(Automation.getActionConsentCallData(sickleAddress!, strategy!))
+          : undefined,
       ]);
-      return {
-        entry: sickles[String(NEST_CHAIN_ID)],
-        requiresConsent,
-        strategy,
-      };
+      return { approved, mask };
     },
   });
-
-  const {
-    writeContract,
-    data: txHash,
-    isPending,
-    error: writeError,
-    reset,
-  } = useWriteContract();
-
-  // A granted consent only shows as granted once this is re-read; the write
-  // alone leaves the panel claiming it is still unconsented.
+  const { refetch: refreshKeeper } = keeper;
   const onConfirmed = useCallback(() => {
     reset();
-    // Keep asking until the granted consent actually shows up. One refetch
-    // here would usually read the pre-consent mask and cache it.
-    consentDeadline.current = indexDeadline();
-    forcePoll(n => n + 1);
-    void refetch();
-  }, [reset, refetch]);
+    void refreshKeeper();
+  }, [refreshKeeper, reset]);
+  const { isConfirming, reverted } = useTxOutcome(txHash, chainId, onConfirmed);
 
-  const { isConfirming, reverted } = useTxOutcome(txHash, onConfirmed);
+  if (!isRelevant) return null;
 
-  if (!address || !data) return null;
+  const active = Boolean(keeper.data && strategy && isAddressEqual(keeper.data.approved, strategy));
+  const mask = keeper.data?.mask;
+  const missing = requiresConsent && mask !== undefined
+    ? requested.filter(permission => (mask & Automation.AutomationPermissionBit[permission]) === 0n)
+    : [];
+  const busy = isPending || isConfirming || isPreparing;
+  const mayWrite = Boolean(address && walletChainId === chainId && strategy && sickleAddress && !busy);
+  const error = wallet.error ?? saved.error ?? keeper.error;
 
-  const { entry, requiresConsent, strategy } = data;
-  if (!entry) return null;
-
-  const sickleAddress = entry.sickleAddress;
-  const consentMask = entry.automation?.consentMask;
-  const consented = entry.automation?.consented?.nftExit === true;
-  const busy = isPending || isConfirming;
-
-  function grantExitConsent() {
-    if (!strategy || !sickleAddress) return;
-    // setActionConsent overwrites the mask, so the current one is OR-ed in
-    // rather than replaced — otherwise this would revoke everything else.
-    const call = Automation.buildSetActionConsent({
-      chainId: NEST_CHAIN_ID,
-      automationStrategyAddress: strategy,
-      sickleAddress,
-      permissions: ['nftExit'],
-      currentConsentMask: consentMask,
-    });
+  function enableKeeper() {
+    if (!mayWrite || !strategy || !sickleAddress) return;
+    setPrepareError(undefined);
     writeContract({
-      chainId: NEST_CHAIN_ID,
-      abi: call.abi,
-      address: call.address,
-      functionName: call.functionName,
-      args: call.args,
-      value: call.value,
+      account: address,
+      chainId,
+      address: sickleAddress,
+      abi: sickleApprovalAbi,
+      functionName: 'setApproved',
+      args: [strategy],
     });
+  }
+
+  async function grantConsent() {
+    if (!mayWrite || !active || !client || !strategy || !sickleAddress) return;
+    setIsPreparing(true);
+    setPrepareError(undefined);
+    try {
+      // Each write replaces the whole mask. Refresh immediately before signing
+      // so grants made elsewhere are preserved, including unrecognized bits.
+      const currentConsentMask = await client.readContract(
+        Automation.getActionConsentCallData(sickleAddress, strategy),
+      );
+      const ungranted = missing.filter(permission =>
+        (currentConsentMask & Automation.AutomationPermissionBit[permission]) === 0n,
+      );
+      if (ungranted.length === 0) {
+        void refreshKeeper();
+        return;
+      }
+      const call = Automation.buildSetActionConsent({
+        chainId,
+        automationStrategyAddress: strategy,
+        sickleAddress,
+        permissions: ungranted,
+        currentConsentMask,
+      });
+      writeContract({
+        account: address, chainId, abi: call.abi, address: call.address,
+        functionName: call.functionName, args: call.args, value: call.value,
+      });
+    } catch (error) {
+      setPrepareError(shortWriteError(error));
+    } finally {
+      setIsPreparing(false);
+    }
   }
 
   return (
     <section className="flex flex-col gap-3 rounded border border-zinc-200 p-4 text-sm dark:border-zinc-800">
       <div className="flex items-center justify-between">
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-zinc-500">
-          Automation
-        </h2>
+        <h2 className="text-sm font-semibold uppercase tracking-wide text-zinc-500">Keeper setup</h2>
         <button
-          onClick={() => void refetch()}
+          type="button"
+          onClick={() => {
+            void wallet.refetch();
+            if (registry && selectedSickle && nftManager) void saved.refetch();
+            if (keeper.data) void refreshKeeper();
+          }}
           className="text-xs text-zinc-500 underline-offset-2 hover:underline"
         >
           Refresh
         </button>
       </div>
 
-      {error && (
-        <p className="text-red-600 dark:text-red-400">
-          {error instanceof Error ? error.message : String(error)}
-        </p>
+      {error && <p role="alert" className="text-red-600 dark:text-red-400">{shortWriteError(error)}</p>}
+      {requested.length === 0 && saved.isSuccess && !saved.isFetching && (
+        <p className="text-zinc-500">This position has no saved keeper actions.</p>
       )}
-
-      <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 font-mono text-xs">
-        <dt className="text-zinc-500">sickle</dt>
-        <dd>
-          {sickleAddress
-            ? shortAddress(sickleAddress)
-            : `not deployed (would be ${shortAddress(entry.predictedSickleAddress)})`}
-        </dd>
-        <dt className="text-zinc-500">consent required</dt>
-        <dd>{requiresConsent ? 'yes' : 'no'}</dd>
-        <dt className="text-zinc-500">mask</dt>
-        <dd>{consentMask ?? '0'}</dd>
-      </dl>
-
-      {requiresConsent && !consented && (
-        <div className="flex flex-col gap-2">
+      {requested.length > 0 && (
+        <>
           <p className="text-zinc-600 dark:text-zinc-400">
-            Auto-exit will not fire until you consent to it. Without this the
-            keeper reverts and nothing tells you.
+            {requested.map(permissionLabel).join(', ')}
+            {selectedSickle && configured.length > 0 && ` · NFT #${position?.nftId.toString()}`}
           </p>
-          <button
-            onClick={grantExitConsent}
-            disabled={!sickleAddress || !strategy || busy || wrongChain}
-            className="self-start rounded border border-zinc-900 px-4 py-2 font-medium disabled:opacity-40 dark:border-zinc-100"
-          >
-            {isPending
-              ? 'Confirm in wallet…'
-              : isConfirming
-                ? 'Consenting…'
-                : 'Consent to auto-exit'}
-          </button>
-          {!sickleAddress && (
-            <p className="text-xs text-zinc-500">
-              Deposit first — consent is granted on a deployed Sickle. This
-              panel refreshes itself once the deposit deploys one.
+          {sickleAddress ? (
+            <p className="font-mono text-xs text-zinc-500">
+              Sickle {shortAddress(sickleAddress)} · {keeper.data ? (active ? 'Keeper approved' : 'Keeper approval needed') : 'Reading approval'}
             </p>
+          ) : (
+            entry && <p className="text-zinc-500">Deposit to create your Sickle before granting consent.</p>
           )}
-          {writeError && (
-            <p className="text-xs text-red-600 dark:text-red-400">
-              The wallet rejected it: {shortWriteError(writeError)}
-            </p>
+          {keeper.data && !active && (
+            <>
+              <p className="text-xs text-zinc-500">
+                Approval applies to all configured positions in this Sickle on {nestChains[chainId].name}.
+                {keeper.data.approved !== zeroAddress && ' This replaces its current approved address.'}
+              </p>
+              <button type="button" onClick={enableKeeper} disabled={!mayWrite} className={buttonStyle}>
+                {busy ? 'Confirming…' : 'Approve keeper for this Sickle'}
+              </button>
+            </>
           )}
-          {reverted && (
-            <p className="text-xs text-red-600 dark:text-red-400">
-              That consent transaction reverted on-chain.
-            </p>
+          {active && missing.length > 0 && (
+            <button type="button" onClick={() => void grantConsent()} disabled={!mayWrite} className={buttonStyle}>
+              {busy ? 'Confirming…' : `Consent to ${missing.map(permissionLabel).join(', ')}`}
+            </button>
           )}
-        </div>
+          {active && (!requiresConsent || (mask !== undefined && missing.length === 0)) && (
+            <p className="text-emerald-700 dark:text-emerald-400">Keeper approval and action permissions are ready.</p>
+          )}
+          <p className="text-xs text-zinc-500">
+            Runs still depend on position triggers and gas economics.{' '}
+            <a href="https://vfat.io/docs/automation" className="underline underline-offset-2">
+              Automation and funding
+            </a>
+          </p>
+        </>
       )}
-
-      {consented && (
-        <p className="text-emerald-700 dark:text-emerald-400">
-          Auto-exit is consented.
+      {(writeError || prepareError || reverted) && (
+        <p role="alert" className="text-red-600 dark:text-red-400">
+          {prepareError ?? (writeError ? shortWriteError(writeError) : 'The keeper setup transaction reverted.')}
         </p>
       )}
     </section>
   );
 }
+
+const buttonStyle = 'self-start rounded border border-zinc-900 px-4 py-2 font-medium disabled:opacity-40 dark:border-zinc-100';

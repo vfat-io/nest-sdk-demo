@@ -3,32 +3,38 @@
 import { useCallback, useMemo, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useAccount } from 'wagmi';
-import { FarmInfo } from '@vfat-io/sickle-sdk';
-import { NEST_CHAIN_ID, depositableFarms, fetchNestFarms } from '@/lib/nest';
+import { Address, AutomationPermissionName, Chains, FarmInfo } from '@vfat-io/sickle-sdk';
+import { depositableFarms, farmKey, fetchNestFarms } from '@/lib/nest';
+import { ELYSIUM_CHAIN_ID, HYPEREVM_CHAIN_ID, NestChainId, nestChains } from '@/lib/chains';
 import { indexDeadline } from '@/lib/indexing';
 import ConnectWallet from './ConnectWallet';
 import FarmList from './FarmList';
 import DepositPanel from './DepositPanel';
 import PositionsPanel, { POSITIONS_QUERY_KEY } from './PositionsPanel';
-import AutomationPanel, { AUTOMATION_QUERY_KEY } from './AutomationPanel';
+import { AUTOMATION_QUERY_KEY } from './AutomationPanel';
 
-export default function NestDemo() {
-  const { isConnected, chainId } = useAccount();
+const hyperEvmPermissions: AutomationPermissionName[] = ['nftExit'];
+
+export default function NestDemo({ chainId }: { chainId: NestChainId }) {
+  const { address, isConnected, chainId: walletChainId } = useAccount();
   const queryClient = useQueryClient();
-  const [selectedAddress, setSelectedAddress] = useState<string>();
-  /**
-   * Until when a just-deposited Sickle is still expected to appear.
-   *
-   * The automation panel cannot see that a deposit happened, and the Sickle it
-   * deploys takes a few seconds to reach the API.
-   */
-  const [expectDeployedUntil, setExpectDeployedUntil] = useState(0);
+  const [selectedFarmKey, setSelectedFarmKey] = useState<string>();
+  const [lastDeposit, setLastDeposit] = useState<{
+    owner: Address;
+    permissions: AutomationPermissionName[];
+    pollUntil: number;
+  }>();
 
   const {
     data: farms,
     error,
     isPending,
-  } = useQuery({ queryKey: ['nest-farms'], queryFn: fetchNestFarms });
+  } = useQuery({ queryKey: ['nest-farms', chainId], queryFn: () => fetchNestFarms(chainId) });
+  const { data: supportsDustDeposit } = useQuery({
+    queryKey: ['nest-dust-deposit', chainId],
+    queryFn: () => Chains.supportsNftSettingsAutoDeposit(chainId),
+    enabled: chainId === ELYSIUM_CHAIN_ID,
+  });
 
   // Killed farms stay in `farms` so existing positions can still be matched
   // and exited; only the picker excludes them.
@@ -39,25 +45,26 @@ export default function NestDemo() {
 
   // Derived, so a farm leaving the list cannot leave a dangling selection.
   const selected: FarmInfo | undefined =
-    openable.find(f => f.address === selectedAddress) ?? openable[0];
+    openable.find(farm => farmKey(farm) === selectedFarmKey) ?? openable[0];
 
   /**
    * A deposit can deploy the Sickle and always changes the position list, and
    * neither panel can see that on its own.
    */
-  const onDeposited = useCallback(() => {
-    setExpectDeployedUntil(indexDeadline());
-    void queryClient.invalidateQueries({ queryKey: [AUTOMATION_QUERY_KEY] });
-    void queryClient.invalidateQueries({ queryKey: [POSITIONS_QUERY_KEY] });
-  }, [queryClient]);
+  const onDeposited = useCallback((permissions: AutomationPermissionName[]) => {
+    if (!address) return;
+    setLastDeposit({ owner: address, permissions, pollUntil: indexDeadline() });
+    void queryClient.invalidateQueries({ queryKey: [AUTOMATION_QUERY_KEY, chainId, address] });
+    void queryClient.invalidateQueries({ queryKey: [POSITIONS_QUERY_KEY, chainId, address] });
+  }, [address, chainId, queryClient]);
 
-  // Every write is pinned to HyperEVM, but a wallet on another chain cannot
-  // sign them, so showing the panels would only offer buttons that fail.
-  const onNestChain = isConnected && chainId === NEST_CHAIN_ID;
+  const onNestChain = isConnected && walletChainId === chainId;
+  const deposit = lastDeposit?.owner === address ? lastDeposit : undefined;
+  const permissions = chainId === HYPEREVM_CHAIN_ID ? hyperEvmPermissions : (deposit?.permissions ?? []);
 
   return (
     <div className="flex flex-col gap-6">
-      <ConnectWallet />
+      <ConnectWallet targetChainId={chainId} />
 
       {error && (
         <p className="rounded bg-red-50 p-3 text-sm text-red-700 dark:bg-red-950 dark:text-red-300">
@@ -72,13 +79,19 @@ export default function NestDemo() {
 
       {isConnected && !onNestChain && (
         <p className="rounded bg-amber-50 p-3 text-sm text-amber-800 dark:bg-amber-950 dark:text-amber-200">
-          This wallet is on chain {chainId ?? 'unknown'}. Nest is on HyperEVM
-          (999) — switch above before quoting or sending anything.
+          This wallet is on chain {walletChainId ?? 'unknown'}. Switch to {nestChains[chainId].name}{' '}
+          ({chainId}) to quote or send a transaction.
         </p>
       )}
 
       {farms && onNestChain && (
-        <PositionsPanel farms={farms} expectChangeUntil={expectDeployedUntil} />
+        <PositionsPanel
+          key={address}
+          chainId={chainId}
+          farms={farms}
+          expectChangeUntil={deposit?.pollUntil}
+          permissions={permissions}
+        />
       )}
 
       {farms && (
@@ -89,7 +102,7 @@ export default function NestDemo() {
           <FarmList
             farms={openable}
             selected={selected}
-            onSelect={farm => setSelectedAddress(farm.address)}
+            onSelect={farm => setSelectedFarmKey(farmKey(farm))}
           />
         </section>
       )}
@@ -98,8 +111,10 @@ export default function NestDemo() {
         // Keyed on the farm: the panel holds a token choice and an amount that
         // mean nothing once the pair changes.
         <DepositPanel
-          key={selected.address}
+          key={`${farmKey(selected)}:${address}`}
+          chainId={chainId}
           farm={selected}
+          supportsDustDeposit={chainId === ELYSIUM_CHAIN_ID && supportsDustDeposit === true}
           onDeposited={onDeposited}
         />
       )}
@@ -109,9 +124,6 @@ export default function NestDemo() {
         </p>
       )}
 
-      {onNestChain && (
-        <AutomationPanel expectDeployedUntil={expectDeployedUntil} />
-      )}
     </div>
   );
 }
