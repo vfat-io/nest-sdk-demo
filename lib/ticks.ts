@@ -64,20 +64,13 @@ export function mintedRangeFromCallData(
 /**
  * An auto-exit trigger that provably encloses `minted`.
  *
- * One tick spacing of clearance on each side, aligned outward, so the trigger
- * is strictly outside the position at both ends: in range means no exit, and
- * leaving the range by one usable tick means exit.
- *
- * This replaces deriving the trigger from `farm.pool.tick`. That tick is
- * whatever `/v4/farms` returned when the page loaded, so the trigger was
- * centred on a stale spot while the position was minted around the current
- * one. A band-width buffer only bought about 1% of drift before the trigger
- * could fall *inside* the minted range and exit a position that had never
- * left it — no use on a page left open for a while before quoting.
+ * The clearance defaults to one tick spacing on each side. Align the
+ * triggers outward, then clamp them at the pool's usable tick limits.
  */
 export function triggerEnclosing(
   minted: TickRange,
-  tickSpacing: number
+  tickSpacing: number,
+  clearance = tickSpacing
 ): TickRange {
   if (!Number.isInteger(tickSpacing) || tickSpacing <= 0) {
     throw new Error(`Unusable tick spacing: ${tickSpacing}`);
@@ -86,8 +79,8 @@ export function triggerEnclosing(
   const usableMin = Math.ceil(MIN_TICK / tickSpacing) * tickSpacing;
   const usableMax = Math.floor(MAX_TICK / tickSpacing) * tickSpacing;
 
-  const min = Math.floor((minted.min - tickSpacing) / tickSpacing) * tickSpacing;
-  const max = Math.ceil((minted.max + tickSpacing) / tickSpacing) * tickSpacing;
+  const min = Math.floor((minted.min - clearance) / tickSpacing) * tickSpacing;
+  const max = Math.ceil((minted.max + clearance) / tickSpacing) * tickSpacing;
 
   return {
     min: Math.max(min, usableMin),

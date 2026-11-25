@@ -3,7 +3,7 @@
 import { useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useAccount } from 'wagmi';
-import { FarmInfo } from '@vfat-io/sickle-sdk';
+import { AutomationPermissionName, FarmInfo } from '@vfat-io/sickle-sdk';
 import {
   farmPair,
   fetchNestPositions,
@@ -22,7 +22,7 @@ export const POSITIONS_QUERY_KEY = 'nest-positions';
 interface Props {
   chainId: NestChainId;
   farms: FarmInfo[];
-  showExitConsent: boolean;
+  permissions: AutomationPermissionName[];
   /**
    * Deadline until which a deposit's new position is still expected.
    *
@@ -37,7 +37,7 @@ export default function PositionsPanel({
   chainId,
   farms,
   expectChangeUntil = 0,
-  showExitConsent,
+  permissions,
 }: Props) {
   const { address } = useAccount();
   const [selectedId, setSelectedId] = useState<string>();
@@ -67,7 +67,6 @@ export default function PositionsPanel({
   // a new id, an exit removes it — cannot leave a dangling selection.
   const selected =
     positions?.find(position => positionKey(position) === selectedId) ?? positions?.[0];
-  const hasAutoExit = positions?.some(entry => entry.position.nftSettings?.autoExit);
   const canManage = selected && (chainId !== ELYSIUM_CHAIN_ID || selected.position.sickleAddress);
 
   /**
@@ -159,9 +158,12 @@ export default function PositionsPanel({
           </p>
         )}
       </section>
-      {(showExitConsent || hasAutoExit) && (
-        <AutomationPanel chainId={chainId} expectDeployedUntil={expectChangeUntil} />
-      )}
+      <AutomationPanel
+        chainId={chainId}
+        permissions={permissions}
+        position={selected}
+        expectDeployedUntil={expectChangeUntil}
+      />
     </>
   );
 }

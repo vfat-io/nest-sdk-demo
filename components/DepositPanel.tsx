@@ -1,10 +1,10 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import { Address, erc20Abi, parseUnits } from 'viem';
 import { useAccount, useReadContract, useWriteContract } from 'wagmi';
 import {
-  ContractCallData,
+  AutomationPermissionName,
   FarmInfo,
   NftPool,
   PlanApproval,
@@ -14,21 +14,16 @@ import { ELYSIUM_CHAIN_ID, NestChainId, transactionUrl } from '@/lib/chains';
 import { explainGasStatus, formatAmount, shortAddress } from '@/lib/format';
 import { gasWithHeadroom } from '@/lib/gas';
 import { shortWriteError } from '@/lib/format';
-import {
-  TickRange,
-  encloses,
-  mintedRangeFromCallData,
-  triggerEnclosing,
-} from '@/lib/ticks';
+import { AutomationSelection, manualSelection, permissionLabel } from '@/lib/automation';
+import { quoteDeposit } from '@/lib/depositQuote';
 import { useBoundQuote } from '@/lib/quote';
 import { useTxOutcome } from '@/lib/receipt';
 
 interface Props {
   chainId: NestChainId;
   farm: FarmInfo;
-  onAutoExitQuoted?: (address: Address) => void;
-  /** Called after a deposit confirms on-chain. */
-  onDeposited?: () => void;
+  supportsDustDeposit: boolean;
+  onDeposited?: (permissions: AutomationPermissionName[]) => void;
 }
 
 /** Returns 0n for anything that is not a positive number. */
@@ -42,44 +37,28 @@ function parseAmount(text: string, decimals: number): bigint {
   }
 }
 
-/** Price range around spot for the new position, in percent. */
-const PRICE_MARGIN = { min: 5, max: 5 };
-
-/**
- * Everything that determines what the deposit will do.
- *
- * Complete on purpose. Nothing the calldata depends on may be derived from
- * mutable page state outside this object, or an unrelated refresh could change
- * the transaction while the key — and so the quote — looked unchanged. That is
- * why the auto-exit trigger is no longer computed from `farm.pool.tick`: it is
- * resolved from the quote's own minted range instead, and travels in the
- * quote's `detail`.
- */
 interface DepositRequest {
   chainId: NestChainId;
   farm: string;
   walletAddress: Address | undefined;
   tokenAddress: Address | undefined;
   amount: bigint;
-  autoExit: boolean;
+  automation: AutomationSelection;
 }
 
-/** What quoting resolved, for display and for the containment assertion. */
-interface DepositDetail {
-  minted: TickRange;
-  trigger?: TickRange;
-}
+type DepositDetail = Awaited<ReturnType<typeof quoteDeposit>>['detail'];
 
-/** How many times to re-quote if spot moves out from under the trigger. */
-const CONTAINMENT_ATTEMPTS = 3;
+type DepositWrite =
+  | { kind: 'approval' }
+  | { kind: 'deposit'; permissions: AutomationPermissionName[] };
 
-export default function DepositPanel({ chainId, farm, onDeposited, onAutoExitQuoted }: Props) {
+export default function DepositPanel({ chainId, farm, supportsDustDeposit, onDeposited }: Props) {
   const { address, chainId: walletChainId } = useAccount();
   const tokens = farmTokens(farm);
 
   const [tokenIndex, setTokenIndex] = useState(0);
   const [amountText, setAmountText] = useState('');
-  const [autoExit, setAutoExit] = useState(false);
+  const [automation, setAutomation] = useState(manualSelection);
 
   const token = tokens[tokenIndex];
   const decimals = token?.decimals ?? 18;
@@ -92,19 +71,13 @@ export default function DepositPanel({ chainId, farm, onDeposited, onAutoExitQuo
     walletAddress: address,
     tokenAddress: token?.address as Address | undefined,
     amount: parseAmount(amountText, decimals),
-    autoExit,
+    automation: { ...automation, depositDust: supportsDustDeposit && automation.depositDust },
   };
 
   const { quote, stale, error, isQuoting, build, discard } = useBoundQuote<
     DepositRequest,
     DepositDetail
   >(request);
-
-  useEffect(() => {
-    if (quote?.detail.trigger && quote.request.walletAddress) {
-      onAutoExitQuoted?.(quote.request.walletAddress);
-    }
-  }, [onAutoExitQuoted, quote]);
 
   const { data: balance } = useReadContract({
     abi: erc20Abi,
@@ -132,23 +105,24 @@ export default function DepositPanel({ chainId, farm, onDeposited, onAutoExitQuo
    * not state, so the handler always reads the current value rather than
    * whatever was captured when the effect first ran.
    */
-  const inFlight = useRef<'approval' | 'deposit' | undefined>(undefined);
+  const inFlight = useRef<DepositWrite | undefined>(undefined);
 
   const onConfirmed = useCallback(() => {
-    if (inFlight.current === 'approval') {
-      inFlight.current = undefined;
+    const confirmed = inFlight.current;
+    inFlight.current = undefined;
+    if (!confirmed) return;
+    if (confirmed.kind === 'approval') {
       reset();
       return;
     }
-    inFlight.current = undefined;
     discard();
-    onDeposited?.();
+    onDeposited?.(confirmed.permissions);
   }, [discard, onDeposited, reset]);
 
   const { isConfirming, succeeded, reverted } = useTxOutcome(txHash, chainId, onConfirmed);
 
   /**
-   * Whether auto-exit can be offered at all.
+   * Whether range-based automation can be offered.
    *
    * Only the tick spacing is needed up front, and that is a fixed property of
    * the pool contract — unlike the current tick, which is a moving number this
@@ -156,7 +130,7 @@ export default function DepositPanel({ chainId, farm, onDeposited, onAutoExitQuo
    * time from what the quote says it will mint.
    */
   const tickSpacing = farm.pool.tickSpacing as number | undefined;
-  const exitAvailable =
+  const rangeAutomationAvailable =
     typeof tickSpacing === 'number' &&
     Number.isInteger(tickSpacing) &&
     tickSpacing > 0;
@@ -222,86 +196,16 @@ export default function DepositPanel({ chainId, farm, onDeposited, onAutoExitQuo
       if (!req.tokenAddress) throw new Error('Pick a token');
       if (req.amount === 0n) throw new Error('Enter an amount');
 
-      const tokenAddress = req.tokenAddress;
-
-      // fromFarmInfo carries the NFT manager, pool address and pool id across
-      // from the API — the NFT endpoints reject a request without the manager.
-      // Rebuilt each pass rather than reused, so addAutoExit cannot stack.
-      const base = () =>
-        NftPool.fromFarmInfo(farm)
-          .deposit({ pricePercentageMargin: PRICE_MARGIN })
-          .withToken({
-            tokenAddress,
-            amount: req.amount,
-            slippage: 0.5,
-            priceImpact: 5,
-          });
-
-      const rangeOf = (data: ContractCallData) => {
-        const minted = mintedRangeFromCallData(data);
-        if (!minted) {
-          throw new Error(
-            'The quote did not say which tick range it will mint, so an ' +
-              'auto-exit range cannot be guaranteed to contain it.'
-          );
-        }
-        return minted;
-      };
-
-      // Pass one tells us the range the API actually prices, which is the only
-      // honest basis for a trigger. It is also the quote itself when auto-exit
-      // is off, so nothing is wasted.
-      const plain = await base().getCallData(req.walletAddress);
-      if (!req.autoExit) {
-        return { callData: plain, detail: { minted: rangeOf(plain) } };
-      }
-      if (!exitAvailable) {
-        throw new Error(`Unusable tick spacing: ${tickSpacing}`);
-      }
-
-      let trigger = triggerEnclosing(rangeOf(plain), tickSpacing!);
-
-      // Pass two quotes with that trigger and checks it against the range
-      // *this* calldata mints — the one about to be signed. If spot moved
-      // enough to shift the range out from under it, widen to the new range
-      // and try again rather than signing a trigger that sits inside it.
-      for (let attempt = 0; attempt < CONTAINMENT_ATTEMPTS; attempt++) {
-        let callData: ContractCallData;
-        try {
-          callData = await base()
-            .addAutoExit({
-              triggerTicks: trigger,
-              exitTokenOutLow: tokenAddress,
-              exitTokenOutHigh: tokenAddress,
-              priceImpactBP: 500,
-              slippageBP: 100,
-            })
-            .getCallData(req.walletAddress);
-        } catch (error) {
-          if (error instanceof Error && 'responseBody' in error &&
-            typeof error.responseBody === 'string' && error.responseBody.includes('"AVR_AUTOMATION_UNAVAILABLE"')) {
-            throw new Error('Auto-exit is currently unavailable for this pool. Uncheck it to get a manual deposit quote.');
-          }
-          throw error;
-        }
-
-        const minted = rangeOf(callData);
-        if (encloses(trigger, minted)) {
-          return { callData, detail: { minted, trigger } };
-        }
-        trigger = triggerEnclosing(minted, tickSpacing!);
-      }
-
-      throw new Error(
-        'Spot kept moving out from under the auto-exit range. Try again, or ' +
-          'deposit without auto-exit.'
+      return quoteDeposit(
+        NftPool.fromFarmInfo(farm), req.walletAddress, req.tokenAddress,
+        req.amount, req.automation, tickSpacing,
       );
     });
   }
 
   function sendApproval(approval: PlanApproval) {
-    if (wrongChain || !quote) return;
-    inFlight.current = 'approval';
+    if (wrongChain || !quote || failedAutomationQuote) return;
+    inFlight.current = { kind: 'approval' };
     writeContract({
       abi: erc20Abi,
       chainId,
@@ -312,8 +216,8 @@ export default function DepositPanel({ chainId, farm, onDeposited, onAutoExitQuo
   }
 
   function sendDeposit() {
-    if (wrongChain || !quote) return;
-    inFlight.current = 'deposit';
+    if (wrongChain || !quote || failedAutomationQuote) return;
+    inFlight.current = { kind: 'deposit', permissions: quote.detail.permissions };
     const { callData } = quote;
     writeContract({
       chainId,
@@ -328,6 +232,9 @@ export default function DepositPanel({ chainId, farm, onDeposited, onAutoExitQuo
 
   const busy = isPending || isConfirming;
   const ready = Boolean(address && request.amount > 0n && !wrongChain);
+  const failedAutomationQuote = Boolean(
+    quote?.detail.permissions.length && quote.callData.gasEstimateStatus !== 'success'
+  );
 
   return (
     <section className="flex flex-col gap-4 rounded border border-zinc-200 p-4 dark:border-zinc-800">
@@ -372,25 +279,64 @@ export default function DepositPanel({ chainId, farm, onDeposited, onAutoExitQuo
         />
       </label>
 
-      <label className="flex items-start gap-2 text-sm">
-        <input
-          type="checkbox"
-          checked={autoExit}
-          onChange={e => setAutoExit(e.target.checked)}
-          disabled={!exitAvailable}
-          className="mt-1"
-        />
-        <span>
-          Auto-exit to {token?.symbol} if the price leaves the range
-          <span className="block text-xs text-zinc-500">
-            {exitAvailable
-              ? chainId === ELYSIUM_CHAIN_ID
-                ? 'The quote checks availability and shows the trigger. The keeper needs your consent to execute it.'
-                : 'The quote shows the trigger before you sign. The keeper needs your consent to execute it.'
-              : `Unavailable for this pool: unusable tick spacing (${tickSpacing}).`}
+      <fieldset className="flex flex-col gap-3 text-sm">
+        <legend className="mb-2 font-medium">Automation</legend>
+        {chainId === ELYSIUM_CHAIN_ID && (
+          <>
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={automation.rebalance}
+                disabled={!rangeAutomationAvailable}
+                onChange={event => setAutomation({ ...automation, rebalance: event.target.checked })}
+              />
+              Auto-rebalance outside the range, keeping the same width
+            </label>
+            <label className="flex flex-wrap items-center gap-2">
+              <span>Trading fees</span>
+              <select
+                value={automation.rewards}
+                onChange={event => setAutomation({
+                  ...automation,
+                  rewards: event.target.value as AutomationSelection['rewards'],
+                })}
+                className="rounded border border-zinc-300 px-2 py-1 dark:border-zinc-700 dark:bg-black"
+              >
+                <option value="off">Manual</option>
+                <option value="harvest">Auto-harvest to wallet</option>
+                <option value="compound">Auto-compound into this position</option>
+              </select>
+            </label>
+          </>
+        )}
+        <label className="flex items-start gap-2">
+          <input
+            type="checkbox"
+            checked={automation.exit}
+            disabled={!rangeAutomationAvailable}
+            onChange={event => setAutomation({ ...automation, exit: event.target.checked })}
+            className="mt-1"
+          />
+          <span>
+            Auto-exit to {token?.symbol} at the quoted trigger ticks
+            {automation.rebalance && (
+              <span className="block text-xs text-zinc-500">
+                The exit band is fixed. Rebalance stops at its bounds.
+              </span>
+            )}
           </span>
-        </span>
-      </label>
+        </label>
+        {supportsDustDeposit && (
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={automation.depositDust}
+              onChange={event => setAutomation({ ...automation, depositDust: event.target.checked })}
+            />
+            Auto-deposit eligible leftover tokens
+          </label>
+        )}
+      </fieldset>
 
       <button
         onClick={buildQuote}
@@ -427,12 +373,14 @@ export default function DepositPanel({ chainId, farm, onDeposited, onAutoExitQuo
             <dd>
               {quote.detail.minted.min} … {quote.detail.minted.max}
             </dd>
-            <dt className="text-zinc-500">auto-exit</dt>
-            <dd>
-              {quote.detail.trigger
-                ? `outside ${quote.detail.trigger.min} … ${quote.detail.trigger.max}`
-                : 'no'}
-            </dd>
+            <dt className="text-zinc-500">automation</dt>
+            <dd>{quote.detail.permissions.map(permissionLabel).join(', ') || 'off'}</dd>
+            {quote.detail.trigger && (
+              <>
+                <dt className="text-zinc-500">exit band</dt>
+                <dd>{quote.detail.trigger.min} … {quote.detail.trigger.max}</dd>
+              </>
+            )}
             <dt className="text-zinc-500">contract</dt>
             <dd>{shortAddress(quote.callData.address)}</dd>
             <dt className="text-zinc-500">function</dt>
@@ -445,10 +393,11 @@ export default function DepositPanel({ chainId, farm, onDeposited, onAutoExitQuo
             )}
           </dl>
 
-          {quote.detail.trigger && (
+          {quote.detail.permissions.length > 0 && (
             <p className="text-xs text-zinc-500">
-              The trigger sits outside the position at both ends, checked
-              against this calldata — in range means no exit.
+              {failedAutomationQuote
+                ? 'Get a successful simulation before submitting an automated deposit.'
+                : 'After the deposit confirms, approve the keeper and any missing action permissions.'}
             </p>
           )}
 
@@ -461,7 +410,7 @@ export default function DepositPanel({ chainId, farm, onDeposited, onAutoExitQuo
                 <button
                   key={approval.tokenAddress}
                   onClick={() => sendApproval(approval)}
-                  disabled={busy || wrongChain}
+                  disabled={busy || wrongChain || failedAutomationQuote}
                   className="rounded border border-zinc-900 px-4 py-2 text-sm font-medium disabled:opacity-40 dark:border-zinc-100"
                 >
                   Approve {formatAmount(BigInt(approval.amount ?? '0'), decimals)}{' '}
@@ -475,7 +424,7 @@ export default function DepositPanel({ chainId, farm, onDeposited, onAutoExitQuo
           ) : (
             <button
               onClick={sendDeposit}
-              disabled={busy || wrongChain}
+              disabled={busy || wrongChain || failedAutomationQuote}
               className="rounded bg-emerald-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
             >
               {isPending

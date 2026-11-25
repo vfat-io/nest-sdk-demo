@@ -3,9 +3,9 @@
 import { useCallback, useMemo, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useAccount } from 'wagmi';
-import { FarmInfo } from '@vfat-io/sickle-sdk';
+import { Address, AutomationPermissionName, Chains, FarmInfo } from '@vfat-io/sickle-sdk';
 import { depositableFarms, farmKey, fetchNestFarms } from '@/lib/nest';
-import { HYPEREVM_CHAIN_ID, NestChainId, nestChains } from '@/lib/chains';
+import { ELYSIUM_CHAIN_ID, HYPEREVM_CHAIN_ID, NestChainId, nestChains } from '@/lib/chains';
 import { indexDeadline } from '@/lib/indexing';
 import ConnectWallet from './ConnectWallet';
 import FarmList from './FarmList';
@@ -13,24 +13,28 @@ import DepositPanel from './DepositPanel';
 import PositionsPanel, { POSITIONS_QUERY_KEY } from './PositionsPanel';
 import { AUTOMATION_QUERY_KEY } from './AutomationPanel';
 
+const hyperEvmPermissions: AutomationPermissionName[] = ['nftExit'];
+
 export default function NestDemo({ chainId }: { chainId: NestChainId }) {
   const { address, isConnected, chainId: walletChainId } = useAccount();
   const queryClient = useQueryClient();
   const [selectedFarmKey, setSelectedFarmKey] = useState<string>();
-  const [autoExitQuoteOwner, setAutoExitQuoteOwner] = useState<typeof address>();
-  /**
-   * Until when a just-deposited Sickle is still expected to appear.
-   *
-   * The automation panel cannot see that a deposit happened, and the Sickle it
-   * deploys takes a few seconds to reach the API.
-   */
-  const [expectDeployedUntil, setExpectDeployedUntil] = useState(0);
+  const [lastDeposit, setLastDeposit] = useState<{
+    owner: Address;
+    permissions: AutomationPermissionName[];
+    pollUntil: number;
+  }>();
 
   const {
     data: farms,
     error,
     isPending,
   } = useQuery({ queryKey: ['nest-farms', chainId], queryFn: () => fetchNestFarms(chainId) });
+  const { data: supportsDustDeposit } = useQuery({
+    queryKey: ['nest-dust-deposit', chainId],
+    queryFn: () => Chains.supportsNftSettingsAutoDeposit(chainId),
+    enabled: chainId === ELYSIUM_CHAIN_ID,
+  });
 
   // Killed farms stay in `farms` so existing positions can still be matched
   // and exited; only the picker excludes them.
@@ -47,15 +51,16 @@ export default function NestDemo({ chainId }: { chainId: NestChainId }) {
    * A deposit can deploy the Sickle and always changes the position list, and
    * neither panel can see that on its own.
    */
-  const onDeposited = useCallback(() => {
-    setExpectDeployedUntil(indexDeadline());
+  const onDeposited = useCallback((permissions: AutomationPermissionName[]) => {
+    if (!address) return;
+    setLastDeposit({ owner: address, permissions, pollUntil: indexDeadline() });
     void queryClient.invalidateQueries({ queryKey: [AUTOMATION_QUERY_KEY, chainId, address] });
     void queryClient.invalidateQueries({ queryKey: [POSITIONS_QUERY_KEY, chainId, address] });
   }, [address, chainId, queryClient]);
 
   const onNestChain = isConnected && walletChainId === chainId;
-  const showConsent = chainId === HYPEREVM_CHAIN_ID ||
-    (address !== undefined && autoExitQuoteOwner === address);
+  const deposit = lastDeposit?.owner === address ? lastDeposit : undefined;
+  const permissions = chainId === HYPEREVM_CHAIN_ID ? hyperEvmPermissions : (deposit?.permissions ?? []);
 
   return (
     <div className="flex flex-col gap-6">
@@ -84,8 +89,8 @@ export default function NestDemo({ chainId }: { chainId: NestChainId }) {
           key={address}
           chainId={chainId}
           farms={farms}
-          expectChangeUntil={expectDeployedUntil}
-          showExitConsent={showConsent}
+          expectChangeUntil={deposit?.pollUntil}
+          permissions={permissions}
         />
       )}
 
@@ -109,8 +114,8 @@ export default function NestDemo({ chainId }: { chainId: NestChainId }) {
           key={`${farmKey(selected)}:${address}`}
           chainId={chainId}
           farm={selected}
+          supportsDustDeposit={chainId === ELYSIUM_CHAIN_ID && supportsDustDeposit === true}
           onDeposited={onDeposited}
-          onAutoExitQuoted={setAutoExitQuoteOwner}
         />
       )}
       {selected && !isConnected && (

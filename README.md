@@ -34,10 +34,17 @@ the quote, approvals, transaction and receipt lookup to the selected chain.
 `NftPool` manages the positions held by the user's Sickle. Wallet-held
 positions are displayed with their custody identified.
 
-The live quote API decides whether a deposit can include auto-exit. Request
-it with the checkbox to check availability for the pool. A rejection leaves
-the manual deposit flow available. When an auto-exit quote is accepted, the
-demo shows the Sickle's consent state and the action to grant consent.
+For a new Elysium position, choose auto-rebalance, auto-harvest or
+auto-compound, auto-exit, and auto-deposit of eligible leftover tokens.
+Harvest and compound are two modes for the same fee setting. The live quote
+API reports availability per pool, and a rejected automation quote leaves
+the manual deposit flow available.
+
+After the deposit confirms, **Keeper setup** shows the selected actions and
+the wallet transactions needed to approve the keeper and grant missing
+permissions. For a held Elysium position, the demo reads its saved settings
+from the NFT settings registry. Runs follow the position's triggers and gas
+economics. See [vfat's automation and funding guide](https://vfat.io/docs/automation).
 
 The position's Harvest and Compound actions handle fees. Elysium NEST
 incentives use the separate wallet or Sickle claim paths described in the
@@ -100,22 +107,13 @@ protocol distributes separately, which these actions do not touch.
   says the chain accepted it. `lib/receipt.ts` acts on each outcome once, from
   an effect rather than from render.
 
-**Auto-exit ticks come from the quote, not from a cached tick.** Quoting a
-deposit reveals the exact range it will mint — the API puts it in the calldata
-at `addLiquidityParams.tickLower/tickUpper` — so the trigger is derived from
-*that*, with one tick spacing of clearance, and then checked against the range
-the final calldata mints before the button appears. In range means no exit; a
-tick outside means exit, and the panel shows both numbers before you sign.
-
-Two weaker versions came before it. One absolute tick pair cannot work across
-pools at all: Nest's farms span roughly -388673 to 264454, so a fixed low tick
-sits above spot for some of them and a fresh position is immediately
-exit-eligible. Deriving from `farm.pool.tick` is better but still wrong — that
-tick is whatever `/v4/farms` returned when the page loaded, so on a page left
-open the trigger ends up centred on a stale spot while the position is minted
-around the current one, and a band-width buffer only buys about 1% of drift
-before the trigger falls *inside* the position it is supposed to contain.
-`lib/ticks.ts`.
+**Rebalance and exit use the quoted mint ticks.** The demo reads the first
+quote's range, builds the settings with `buildNftSettings`, and passes both
+fixed ticks and the settings to `QuoteAPI.DepositTokenToNft`. It verifies
+the final calldata's ticks and settings before offering the deposit. New
+rebalance ranges keep the same width. When both actions are on, the demo
+places the fixed exit triggers outside the initial range and uses them as
+the rebalance cutoffs. `lib/depositQuote.ts` and `lib/automation.ts`.
 
 **A failed send is never silent.** `writeContract` can fail before anything
 reaches the chain — a rejection in the wallet, gas estimation reverting on an
@@ -137,13 +135,10 @@ tree. Passing the estimate verbatim reverted a deposit here at 950,395 gas with
 `ReentrancySentryOOG`; the same deposit then needed 1,301,233. `lib/gas.ts` adds
 20% for every write. Unused limit is not charged.
 
-**Automation consent.** HyperEVM and Elysium set `sickle.automationRequiresConsent`, which
-means the keeper reverts `ActionNotConsented` until the Sickle owner has
-consented — silently, as far as the user can tell. `AutomationPanel` reads the
-current mask and builds the `setActionConsent` call with
-`Automation.buildSetActionConsent`. That helper ORs into the existing mask,
-because `setActionConsent` overwrites it and a naive call would revoke consent
-the user had already given.
+**Automation consent.** HyperEVM and Elysium require per-action consent.
+`AutomationPanel` reads the current Sickle approval and on-chain consent mask.
+It uses `Automation.buildSetActionConsent` to add the selected action bits
+and preserve the rest. Regular Sickle NFT rebalances use `nftRebalanceGeneric`.
 
 ## Shape of the code
 
@@ -154,14 +149,16 @@ lib/format.ts           display helpers
 lib/gas.ts              headroom over the quote's gas estimate
 lib/quote.ts            calldata bound to the inputs that produced it
 lib/receipt.ts          one-shot, status-aware receipt handling
-lib/ticks.ts            auto-exit range derived from the quote's own calldata
+lib/ticks.ts            quoted mint ranges and exit bands
+lib/depositQuote.ts     deposit quotes with verified NFT settings
+lib/automation.ts       settings and permission names for each action
 lib/indexing.ts         polling a write through the indexer's lag
 components/Providers    wagmi, scoped to the demo networks
 components/FarmList     the farm picker
 components/DepositPanel quote -> approve -> deposit
 components/PositionsPanel   the caller's open positions
 components/ManagePanel  increase, decrease, rebalance, harvest, compound, exit
-components/AutomationPanel  consent state and the consent call
+components/AutomationPanel  keeper approval and per-action consent
 ```
 
 Four deliberate choices worth calling out:
